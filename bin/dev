@@ -1,0 +1,80 @@
+#!/bin/bash
+
+PROJECT_NAME=$(basename $(pwd))
+MAIN_PATH=$(pwd)
+
+# [기능 1] 세션 목록 출력 (dev -l)
+if [ "$1" == "-l" ]; then
+    echo "Sessions for $PROJECT_NAME:"
+    git worktree list | tail -n +2 | while read -r line; do
+        WP_PATH=$(echo "$line" | awk '{print $1}')
+        WP_NAME=$(basename "$WP_PATH" | sed "s/${PROJECT_NAME}_//")
+        if tmux has-session -t "dev_$WP_NAME" 2>/dev/null; then
+            echo "  * $WP_NAME [$(git -C "$WP_PATH" rev-parse --abbrev-ref HEAD)] 3 windows"
+        else
+            echo "  - $WP_NAME [$(git -C "$WP_PATH" rev-parse --abbrev-ref HEAD)] (no tmux)"
+        fi
+    done
+    exit 0
+fi
+
+# [기능 2] 정리 로직 (dev -c ...)
+if [ "$1" == "-c" ]; then
+    OPTION=$2
+    if [ -z "$OPTION" ]; then echo "[ERROR] 대상을 지정하십시오."; exit 1; fi
+
+    if [ "$OPTION" == "--all" ]; then
+        git worktree list | tail -n +2 | while read -r line; do
+            WP_PATH=$(echo "$line" | awk '{print $1}'); WP_NAME=$(basename "$WP_PATH" | sed "s/${PROJECT_NAME}_//")
+            tmux kill-session -t "dev_$WP_NAME" 2>/dev/null; git worktree remove "$WP_PATH" --force; git branch -D "$WP_NAME" 2>/dev/null
+        done
+        echo "[SUCCESS] 전체 정리가 완료되었습니다."
+    elif [ "$OPTION" == "--orphans" ]; then
+        git worktree list | tail -n +2 | while read -r line; do
+            WP_PATH=$(echo "$line" | awk '{print $1}'); WP_NAME=$(basename "$WP_PATH" | sed "s/${PROJECT_NAME}_//")
+            if ! tmux has-session -t "dev_$WP_NAME" 2>/dev/null; then
+                git worktree remove "$WP_PATH" --force; git branch -D "$WP_NAME" 2>/dev/null
+            fi
+        done
+        echo "[SUCCESS] 미사용 워크트리 정리가 완료되었습니다."
+    else
+        tmux kill-session -t "dev_$OPTION" 2>/dev/null
+        WP_PATH=$(git worktree list | grep "$OPTION" | awk '{print $1}')
+        [ -n "$WP_PATH" ] && git worktree remove "$WP_PATH" --force && git branch -D "$OPTION" 2>/dev/null
+        echo "[SUCCESS] '$OPTION' 환경 정리를 완료했습니다."
+    fi
+    exit 0
+fi
+
+# [기능 3] 생성 및 인터랙티브 메뉴 (dev 이름)
+TARGET_NAME=$1
+if [ -z "$TARGET_NAME" ]; then
+    TARGET_PATH="$MAIN_PATH"
+    SESSION="dev_$PROJECT_NAME"
+else
+    TARGET_PATH="../${PROJECT_NAME}_$TARGET_NAME"
+    SESSION="dev_$TARGET_NAME"
+    if [ ! -d "$TARGET_PATH" ]; then
+        git worktree add "$TARGET_PATH" -b "$TARGET_NAME"
+    fi
+fi
+
+# 세션이 이미 존재할 경우 fzf 메뉴 띄우기
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    ACTION=$(echo -e "attach\nrestart\nstop" | fzf --header="Action for $SESSION:")
+    case "$ACTION" in
+        attach) tmux attach-session -t "$SESSION"; exit 0 ;;
+        restart) tmux kill-session -t "$SESSION" ;;
+        stop) $0 -c "$TARGET_NAME"; exit 0 ;;
+        *) exit 0 ;;
+    esac
+fi
+
+# 세션 생성 (3개 창 세팅)
+tmux new-session -d -s "$SESSION" -n "code" -c "$TARGET_PATH"
+tmux send-keys -t "$SESSION:code" "opencode" Enter
+tmux new-window -t "$SESSION" -n "git" -c "$TARGET_PATH"
+tmux send-keys -t "$SESSION:git" "lazygit" Enter
+tmux new-window -t "$SESSION" -n "term" -c "$TARGET_PATH"
+tmux select-window -t "$SESSION:code"
+tmux attach-session -t "$SESSION"
