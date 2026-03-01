@@ -1,80 +1,237 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-PROJECT_NAME=$(basename $(pwd))
-MAIN_PATH=$(pwd)
+set -euo pipefail
 
-# [기능 1] 세션 목록 출력 (dev -l)
-if [ "$1" == "-l" ]; then
-    echo "Sessions for $PROJECT_NAME:"
-    git worktree list | tail -n +2 | while read -r line; do
-        WP_PATH=$(echo "$line" | awk '{print $1}')
-        WP_NAME=$(basename "$WP_PATH" | sed "s/${PROJECT_NAME}_//")
-        if tmux has-session -t "dev_$WP_NAME" 2>/dev/null; then
-            echo "  * $WP_NAME [$(git -C "$WP_PATH" rev-parse --abbrev-ref HEAD)] 3 windows"
-        else
-            echo "  - $WP_NAME [$(git -C "$WP_PATH" rev-parse --abbrev-ref HEAD)] (no tmux)"
-        fi
-    done
-    exit 0
+if ! command -v git >/dev/null 2>&1; then
+    echo "[ERROR] git is required."
+    exit 1
 fi
 
-# [기능 2] 정리 로직 (dev -c ...)
-if [ "$1" == "-c" ]; then
-    OPTION=$2
-    if [ -z "$OPTION" ]; then echo "[ERROR] 대상을 지정하십시오."; exit 1; fi
-
-    if [ "$OPTION" == "--all" ]; then
-        git worktree list | tail -n +2 | while read -r line; do
-            WP_PATH=$(echo "$line" | awk '{print $1}'); WP_NAME=$(basename "$WP_PATH" | sed "s/${PROJECT_NAME}_//")
-            tmux kill-session -t "dev_$WP_NAME" 2>/dev/null; git worktree remove "$WP_PATH" --force; git branch -D "$WP_NAME" 2>/dev/null
-        done
-        echo "[SUCCESS] 전체 정리가 완료되었습니다."
-    elif [ "$OPTION" == "--orphans" ]; then
-        git worktree list | tail -n +2 | while read -r line; do
-            WP_PATH=$(echo "$line" | awk '{print $1}'); WP_NAME=$(basename "$WP_PATH" | sed "s/${PROJECT_NAME}_//")
-            if ! tmux has-session -t "dev_$WP_NAME" 2>/dev/null; then
-                git worktree remove "$WP_PATH" --force; git branch -D "$WP_NAME" 2>/dev/null
-            fi
-        done
-        echo "[SUCCESS] 미사용 워크트리 정리가 완료되었습니다."
-    else
-        tmux kill-session -t "dev_$OPTION" 2>/dev/null
-        WP_PATH=$(git worktree list | grep "$OPTION" | awk '{print $1}')
-        [ -n "$WP_PATH" ] && git worktree remove "$WP_PATH" --force && git branch -D "$OPTION" 2>/dev/null
-        echo "[SUCCESS] '$OPTION' 환경 정리를 완료했습니다."
-    fi
-    exit 0
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "[ERROR] tmux is required."
+    exit 1
 fi
 
-# [기능 3] 생성 및 인터랙티브 메뉴 (dev 이름)
-TARGET_NAME=$1
-if [ -z "$TARGET_NAME" ]; then
-    TARGET_PATH="$MAIN_PATH"
-    SESSION="dev_$PROJECT_NAME"
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+PROJECT_NAME="$(basename "$REPO_ROOT")"
+MAIN_PATH="$REPO_ROOT"
+CURRENT_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+
+if [[ "$PROJECT_NAME" == *"_$CURRENT_BRANCH" ]]; then
+    BASE_NAME="${PROJECT_NAME%_$CURRENT_BRANCH}"
 else
-    TARGET_PATH="../${PROJECT_NAME}_$TARGET_NAME"
-    SESSION="dev_$TARGET_NAME"
-    if [ ! -d "$TARGET_PATH" ]; then
-        git worktree add "$TARGET_PATH" -b "$TARGET_NAME"
+    BASE_NAME="$PROJECT_NAME"
+fi
+
+resolve_activate_script() {
+    local target_path="$1"
+
+    if [[ -n "${VENV_ACTIVATE:-}" && -f "${VENV_ACTIVATE}" ]]; then
+        printf '%s' "${VENV_ACTIVATE}"
+        return 0
+    fi
+
+    if [[ -f "$target_path/.venv/bin/activate" ]]; then
+        printf '%s' "$target_path/.venv/bin/activate"
+        return 0
+    fi
+
+    if [[ -f "$MAIN_PATH/.venv/bin/activate" ]]; then
+        printf '%s' "$MAIN_PATH/.venv/bin/activate"
+        return 0
+    fi
+
+    printf ''
+}
+
+build_window_command() {
+    local cmd="$1"
+    local target_path="$2"
+    local activate_script
+
+    activate_script="$(resolve_activate_script "$target_path")"
+    if [[ -n "$activate_script" ]]; then
+        printf 'source "%s" && %s' "$activate_script" "$cmd"
+    else
+        printf '%s' "$cmd"
+    fi
+}
+
+print_help() {
+    cat <<EOF
+Usage:
+  dev [name]
+  dev -l
+  dev -c <name>
+  dev -c --orphans
+  dev -c --all
+  dev -h | --help
+
+What it manages:
+  - Worktree: a separate directory checked out to a branch
+  - Tmux session: terminal workspace named dev_<name>
+
+Examples:
+  dev b               Create/attach branch b workspace (e.g. ${BASE_NAME}_b)
+  dev -l              List worktrees and tmux status
+  dev -c test         Remove test tmux/session + worktree + local branch
+  dev -c --orphans    Remove worktrees that have no matching tmux session
+  dev -c --all        Remove all managed worktrees/sessions
+
+Notes:
+  - Use --orphans (double dash). -orphans is also accepted as alias.
+  - Cleanup commands remove directories and local branches.
+  - Set VENV_ACTIVATE to force a specific virtualenv activate script.
+EOF
+}
+
+list_managed_worktrees() {
+    git worktree list --porcelain | while IFS= read -r line; do
+        case "$line" in
+            worktree\ *)
+                wp_path="${line#worktree }"
+                wp_name="$(basename "$wp_path")"
+                if [[ "$wp_name" == "${BASE_NAME}_"* ]]; then
+                    wp_key="${wp_name#${BASE_NAME}_}"
+                    printf '%s|%s\n' "$wp_path" "$wp_key"
+                fi
+                ;;
+        esac
+    done
+}
+
+cleanup_target() {
+    local key="$1"
+    local wp_path=""
+
+    while IFS='|' read -r path name; do
+        if [[ "$name" == "$key" ]]; then
+            wp_path="$path"
+            break
+        fi
+    done < <(list_managed_worktrees)
+
+    tmux kill-session -t "dev_$key" 2>/dev/null || true
+
+    if [[ -n "$wp_path" ]]; then
+        git worktree remove "$wp_path" --force
+    fi
+
+    git branch -D "$key" 2>/dev/null || true
+    echo "[SUCCESS] '$key' environment cleanup completed."
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    print_help
+    exit 0
+fi
+
+if [[ "${1:-}" == "-l" ]]; then
+    echo "Sessions for $BASE_NAME:"
+
+    while IFS='|' read -r wp_path wp_key; do
+        wp_branch="$(git -C "$wp_path" rev-parse --abbrev-ref HEAD)"
+        session="dev_$wp_key"
+        if tmux has-session -t "$session" 2>/dev/null; then
+            attached="detached"
+            if tmux list-sessions -F '#{session_name} #{?session_attached,attached,detached}' 2>/dev/null | awk -v s="$session" '$1 == s { print $2; found=1 } END { if (!found) print "detached" }' | grep -q '^attached$'; then
+                attached="attached"
+            fi
+            echo "  * $wp_key [$wp_branch] (tmux: $session, $attached)"
+        else
+            echo "  - $wp_key [$wp_branch] (no tmux)"
+        fi
+    done < <(list_managed_worktrees)
+
+    exit 0
+fi
+
+if [[ "${1:-}" == "-c" ]]; then
+    option="${2:-}"
+    if [[ -z "$option" ]]; then
+        echo "[ERROR] Specify a target."
+        echo "Try: dev -c <name> | dev -c --orphans | dev -c --all"
+        exit 1
+    fi
+
+    if [[ "$option" == "-orphans" ]]; then
+        option="--orphans"
+    fi
+
+    if [[ "$option" == "--all" ]]; then
+        while IFS='|' read -r _ path_key; do
+            cleanup_target "$path_key"
+        done < <(list_managed_worktrees)
+        echo "[SUCCESS] All managed environments cleaned up."
+    elif [[ "$option" == "--orphans" ]]; then
+        while IFS='|' read -r _ path_key; do
+            if ! tmux has-session -t "dev_$path_key" 2>/dev/null; then
+                cleanup_target "$path_key"
+            fi
+        done < <(list_managed_worktrees)
+        echo "[SUCCESS] Orphan worktrees cleaned up."
+    else
+        key="$option"
+        if [[ "$key" == "${BASE_NAME}_"* ]]; then
+            key="${key#${BASE_NAME}_}"
+        fi
+        cleanup_target "$key"
+    fi
+
+    exit 0
+fi
+
+target_name="${1:-}"
+if [[ -z "$target_name" ]]; then
+    target_path="$MAIN_PATH"
+    session="dev_$CURRENT_BRANCH"
+else
+    target_path="../${BASE_NAME}_$target_name"
+    session="dev_$target_name"
+    if [[ ! -d "$target_path" ]]; then
+        git worktree add "$target_path" -b "$target_name"
     fi
 fi
 
-# 세션이 이미 존재할 경우 fzf 메뉴 띄우기
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-    ACTION=$(echo -e "attach\nrestart\nstop" | fzf --header="Action for $SESSION:")
-    case "$ACTION" in
-        attach) tmux attach-session -t "$SESSION"; exit 0 ;;
-        restart) tmux kill-session -t "$SESSION" ;;
-        stop) $0 -c "$TARGET_NAME"; exit 0 ;;
-        *) exit 0 ;;
+if tmux has-session -t "$session" 2>/dev/null; then
+    if command -v fzf >/dev/null 2>&1; then
+        action="$(printf "attach\nrestart\nstop" | fzf --header="Action for $session:")"
+    else
+        action="attach"
+    fi
+
+    case "$action" in
+        attach)
+            tmux attach-session -t "$session"
+            exit 0
+            ;;
+        restart)
+            tmux kill-session -t "$session"
+            ;;
+        stop)
+            if [[ -z "$target_name" ]]; then
+                echo "[INFO] No target name provided. Use: dev -c <name>"
+                exit 0
+            fi
+            "$0" -c "$target_name"
+            exit 0
+            ;;
+        *)
+            exit 0
+            ;;
     esac
 fi
 
-# 세션 생성 (3개 창 세팅)
-tmux new-session -d -s "$SESSION" -n "code" -c "$TARGET_PATH"
-tmux send-keys -t "$SESSION:code" "opencode" Enter
-tmux new-window -t "$SESSION" -n "git" -c "$TARGET_PATH"
-tmux send-keys -t "$SESSION:git" "lazygit" Enter
-tmux new-window -t "$SESSION" -n "term" -c "$TARGET_PATH"
-tmux select-window -t "$SESSION:code"
-tmux attach-session -t "$SESSION"
+tmux new-session -d -s "$session" -n "code" -c "$target_path"
+tmux send-keys -t "$session:code" "$(build_window_command opencode "$target_path")" Enter
+tmux new-window -t "$session" -n "git" -c "$target_path"
+tmux send-keys -t "$session:git" "$(build_window_command lazygit "$target_path")" Enter
+tmux new-window -t "$session" -n "term" -c "$target_path"
+
+activate_script="$(resolve_activate_script "$target_path")"
+if [[ -n "$activate_script" ]]; then
+    tmux send-keys -t "$session:term" "source \"$activate_script\"" Enter
+fi
+
+tmux select-window -t "$session:code"
+tmux attach-session -t "$session"

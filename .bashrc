@@ -121,9 +121,13 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
 
 
-eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv bash)"
+if command -v brew >/dev/null 2>&1; then
+    eval "$("$(command -v brew)" shellenv)"
+elif [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+    eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+fi
 export PATH="$HOME/.local/bin:$PATH"
 # 프로젝트 폴더에 .venv가 있으면 자동으로 켜기
-if [ -d "./.venv" ]; then
-    source ./.venv/bin/activate
+if [ -f "./.venv/bin/activate" ]; then
+    source "./.venv/bin/activate"
 fi
