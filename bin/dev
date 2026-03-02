@@ -57,6 +57,11 @@ build_window_command() {
     fi
 }
 
+session_name_for_key() {
+    local key="$1"
+    printf 'dev_%s_%s' "$BASE_NAME" "$key"
+}
+
 print_help() {
     cat <<EOF
 Usage:
@@ -69,10 +74,11 @@ Usage:
 
 What it manages:
   - Worktree: a separate directory checked out to a branch
-  - Tmux session: terminal workspace named dev_<name>
+  - Tmux session: terminal workspace named dev_<project>_<name>
 
 Examples:
   dev b               Create/attach branch b workspace (e.g. ${BASE_NAME}_b)
+                      Tmux session example: dev_${BASE_NAME}_b
   dev -l              List worktrees and tmux status
   dev -c test         Remove test tmux/session + worktree + local branch
   dev -c --orphans    Remove worktrees that have no matching tmux session
@@ -111,7 +117,7 @@ cleanup_target() {
         fi
     done < <(list_managed_worktrees)
 
-    tmux kill-session -t "dev_$key" 2>/dev/null || true
+    tmux kill-session -t "$(session_name_for_key "$key")" 2>/dev/null || true
 
     if [[ -n "$wp_path" ]]; then
         git worktree remove "$wp_path" --force
@@ -131,7 +137,7 @@ if [[ "${1:-}" == "-l" ]]; then
 
     while IFS='|' read -r wp_path wp_key; do
         wp_branch="$(git -C "$wp_path" rev-parse --abbrev-ref HEAD)"
-        session="dev_$wp_key"
+        session="$(session_name_for_key "$wp_key")"
         if tmux has-session -t "$session" 2>/dev/null; then
             attached="detached"
             if tmux list-sessions -F '#{session_name} #{?session_attached,attached,detached}' 2>/dev/null | awk -v s="$session" '$1 == s { print $2; found=1 } END { if (!found) print "detached" }' | grep -q '^attached$'; then
@@ -165,7 +171,7 @@ if [[ "${1:-}" == "-c" ]]; then
         echo "[SUCCESS] All managed environments cleaned up."
     elif [[ "$option" == "--orphans" ]]; then
         while IFS='|' read -r _ path_key; do
-            if ! tmux has-session -t "dev_$path_key" 2>/dev/null; then
+            if ! tmux has-session -t "$(session_name_for_key "$path_key")" 2>/dev/null; then
                 cleanup_target "$path_key"
             fi
         done < <(list_managed_worktrees)
@@ -184,10 +190,10 @@ fi
 target_name="${1:-}"
 if [[ -z "$target_name" ]]; then
     target_path="$MAIN_PATH"
-    session="dev_$CURRENT_BRANCH"
+    session="$(session_name_for_key "$CURRENT_BRANCH")"
 else
     target_path="../${BASE_NAME}_$target_name"
-    session="dev_$target_name"
+    session="$(session_name_for_key "$target_name")"
     if [[ ! -d "$target_path" ]]; then
         git worktree add "$target_path" -b "$target_name"
     fi
